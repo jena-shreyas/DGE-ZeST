@@ -8,6 +8,7 @@ data:
   batch_size: 1
   source: ??? # path to the dataset
   depth_path: ???   # path to the depth maps
+  mask_path: ???    # path to the masks
   max_view_num: 20
   eval_camera_distance: 4.0
   camera_distance_range: [1.5, 4.0]
@@ -58,6 +59,7 @@ system:
     controlnet_path: "diffusers/controlnet-depth-sdxl-1.0"
     controlnet_conditioning_scale: 0.9
     num_inference_steps: 30
+    enable_memory_efficient_attention: True
     
     min_step_percent: 0.02
     max_step_percent: 0.98

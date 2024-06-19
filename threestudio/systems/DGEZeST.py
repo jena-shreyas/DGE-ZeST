@@ -257,7 +257,9 @@ class DGEZeST(BaseLift3DSystem):
                         "height": self.trainer.datamodule.train_dataset.height,
                         "width": self.trainer.datamodule.train_dataset.width,
                     }
-                    out = self(cur_batch)["comp_rgb"]
+                    out = self(cur_batch)["comp_rgb"]       # torch.Tensor
+                    # print("Render all view out vals : ", out.shape, out.min(), out.max())
+                    # exit(0)
                     out_to_save = (
                             out[0].cpu().detach().numpy().clip(0.0, 1.0) * 255.0
                     ).astype(np.uint8)
@@ -532,28 +534,28 @@ class DGEZeST(BaseLift3DSystem):
             ) -> Image.Image:
         
         # assert image.max() <= 1.0 and image.min() >= 0.0, "Image should be normalized between 0 and 1.0"
-        out = np.array(image[0].cpu().detach().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
-        print(out.max(), out.min())         # 255, 1
-        target_image = Image.fromarray(out)  # convert to PIL image 
+        out = np.array(image[0].cpu().detach().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)         # 512,512,3
+        # print(out.max(), out.min())         # 255, 1
+        init_img = Image.fromarray(out)  # convert to PIL image 
 
-        gray_target_image = target_image.convert('L').convert('RGB')
-        gray_target_image = ImageEnhance.Brightness(gray_target_image)
+        # gray_target_image = init_img.convert('L').convert('RGB')
+        # gray_target_image = ImageEnhance.Brightness(gray_target_image)
 
-        # Adjust brightness
-        # The factor 1.0 means original brightness, greater than 1.0 makes the image brighter. Adjust this if the image is too dim
-        factor = 1.0  # Try adjusting this to get the desired brightness
+        # # Adjust brightness
+        # # The factor 1.0 means original brightness, greater than 1.0 makes the image brighter. Adjust this if the image is too dim
+        # factor = 1.0  # Try adjusting this to get the desired brightness
 
-        invert_mask = ImageChops.invert(mask)
-        gray_target_image = gray_target_image.enhance(factor)
-        grayscale_img = ImageChops.darker(gray_target_image, mask)
-        img_black_mask = ImageChops.darker(target_image, invert_mask)
-        grayscale_init_img = ImageChops.lighter(img_black_mask, grayscale_img)
-        init_img = grayscale_init_img
-        y = torch.randint(0, 512, (1,)).item()
-        init_img.save(f'grayscale_rendered_image_{y}.png')
-        # out = torch.tensor(
-        #     np.array(init_img) / 255.0, device="cuda", dtype=torch.float32
-        # )[None]     # 1 x 512 x 512 x 3
+        # invert_mask = ImageChops.invert(mask)
+        # gray_target_image = gray_target_image.enhance(factor)
+        # grayscale_img = ImageChops.darker(gray_target_image, mask)
+        # img_black_mask = ImageChops.darker(init_img, invert_mask)
+        # grayscale_init_img = ImageChops.lighter(img_black_mask, grayscale_img)
+        # init_img = grayscale_init_img
+        # y = torch.randint(0, 512, (1,)).item()
+        # init_img.save(f'grayscale_rendered_image_{y}.png')
+        # # out = torch.tensor(
+        # #     np.array(init_img) / 255.0, device="cuda", dtype=torch.float32
+        # # )[None]     # 1 x 512 x 512 x 3
 
         return init_img
 
@@ -612,7 +614,7 @@ class DGEZeST(BaseLift3DSystem):
                 out = out_pkg["comp_rgb"]
 
                 ####
-                # print(out.shape)    # 1, 512, 512, 3 (1, H, W, C)
+                # print(out.shape)    # 1, 512, 512, 3 (1, H, W, C) (Max : 1.0, min: 0.0)
                 # print(out)
                 # exit(0)
                 ####
@@ -620,10 +622,14 @@ class DGEZeST(BaseLift3DSystem):
                 if self.cfg.use_masked_image:
                     out = out * out_pkg["masks"].unsqueeze(-1)
 
+                # print("Out image vals : ", out.max(), out.min())
+                # exit(0)
+
                 ### TODO: Convert rendered image into FG-grayscale rendered imag
                 # out: torch.Tensor (1, H, W, C)
                 # apply transformations for fg-grayscale image
 
+                ### TODO: Check whether this transformation affects nan values
                 out: Image.Image = self.prepare_rendered_image(out, mask)
                 images.append(out)
                 ##########

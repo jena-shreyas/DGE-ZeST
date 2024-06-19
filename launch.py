@@ -192,7 +192,8 @@ def main(args, extras) -> None:
         system.set_resume_status(ckpt["epoch"], ckpt["global_step"])
 
     # Here, datamodule "dm" which has training and val data is passed to trainer for training
-    if args.trainre        trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
+    if args.train:
+        trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
         trainer.test(system, datamodule=dm)
         if args.gradio:
             # also export assets if in gradio mode

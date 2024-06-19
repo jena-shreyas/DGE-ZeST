@@ -100,6 +100,7 @@ class DGEGuidance(BaseObject):
                     "xformers is not available, memory efficient attention is not enabled."
                 )
             else:
+                print("Setting xformers memory efficient attention")
                 self.pipe.enable_xformers_memory_efficient_attention()
 
         if self.cfg.enable_sequential_cpu_offload:
@@ -169,7 +170,7 @@ class DGEGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
+        posterior = self.vae.encode(imgs).latent_dist
         latents = posterior.sample() * self.vae.config.scaling_factor
         return latents.to(input_dtype)
 
@@ -740,7 +741,7 @@ class DGEZestGuidance(DGEGuidance):
         # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
         # and half precision
         mask = torch.nn.functional.interpolate(
-            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+            mask, size=(height // self.pipe.vae_scale_factor, width // self.pipe.vae_scale_factor)
         )
         mask = mask.to(device=device, dtype=dtype)
 
@@ -759,7 +760,7 @@ class DGEZestGuidance(DGEGuidance):
         masked_image_latents = None
         if masked_image is not None:
             masked_image = masked_image.to(device=device, dtype=dtype)
-            masked_image_latents = self._encode_vae_image(masked_image, generator=generator)
+            masked_image_latents = self.pipe._encode_vae_image(masked_image, generator=generator)
             if masked_image_latents.shape[0] < batch_size:
                 if not batch_size % masked_image_latents.shape[0] == 0:
                     raise ValueError(
@@ -847,6 +848,9 @@ class DGEZestGuidance(DGEGuidance):
                         image in original_images
                     ]
 
+        init_images: torch.Tensor = torch.cat(init_images, dim=0).to(dtype=torch.float32, device=device)   # 20 x 3 x 512 x 512
+        print("Init images : ", init_images.shape, init_images.max(), init_images.min())     # 1, -1
+
         # prepare depth maps (control images)
         depth_maps = [                      # list of control image tensors (len = 20) (each of shape 2,3,512,512)
                         self.pipe.prepare_control_image(
@@ -869,18 +873,19 @@ class DGEZestGuidance(DGEGuidance):
         masks = [
                 self.pipe.mask_processor.preprocess(            # list of mask tensors (len = 20) (each of shape 1,1,512,512)
                     mask_image, height=height, width=width, resize_mode=resize_mode, crops_coords=crops_coords
-                )
+                ).to(dtype=torch.float32, device=device)
             for mask_image in masks
         ]
+        masks = torch.cat(masks, dim=0)     # 20 x 1 x 512 x 512
 
         # Mask the original FG-Grayscaled images with mask
         masked_images = [
-            init_image * (mask < 0.5)
+            init_image * (mask < 0.5)           # (3, 512, 512) * (1, 512, 512)
             for init_image, mask in zip(init_images, masks)
         ]
 
         assert len(init_images) > 0, "No images to edit"
-        _, _, height, width = init_images[0].shape
+        _, _, height, width = init_images.shape
 
         # 6. Prepare latent variables
         num_channels_latents = self.vae.config.latent_channels      # 4
@@ -898,51 +903,44 @@ class DGEZestGuidance(DGEGuidance):
 
         with torch.no_grad():
             latent_samples, noise_samples, images_latents = [], [], []
-            for image in init_images:
-                # create the noised image latents
-                latent_outputs: Tuple[List[torch.Tensor]] = self.pipe.prepare_latents(
-                    batch_size * num_images_per_prompt,
-                    num_channels_latents,
-                    height,
-                    width,
-                    torch.float32,      # prompt_embeds.dtype
-                    device,
-                    generator,
-                    None,
-                    image=image,
-                    timestep=latent_timestep,
-                    is_strength_max=is_strength_max,
-                    add_noise=add_noise,
-                    return_noise=True,
-                    return_image_latents=return_image_latents,
-                )
 
-                latent_outputs: Tuple[List[torch.Tensor]] = self.pipe.prepare_latents(
-                    batch_size * num_images_per_prompt,
-                    num_channels_latents,
-                    height,
-                    width,
-                    torch.float32,      # prompt_embeds.dtype
-                    device,
-                    generator,
-                    None,
-                    image=image,
-                    timestep=latent_timestep,
-                    is_strength_max=is_strength_max,
-                    add_noise=add_noise,
-                    return_noise=True,
-                    return_image_latents=return_image_latents,
-                )
+            ############
+            # TODO: Not working due to some vae encode issue.
+            ############
+            # for image in init_images:
+            #     # create the noised image latents
+            #     latent_outputs: Tuple[List[torch.Tensor]] = self.pipe.prepare_latents(
+            #         batch_size * num_images_per_prompt,
+            #         num_channels_latents,
+            #         height,
+            #         width,
+            #         torch.float32,      # prompt_embeds.dtype
+            #         device,
+            #         generator,
+            #         None,
+            #         image=image,
+            #         timestep=latent_timestep,
+            #         is_strength_max=is_strength_max,
+            #         add_noise=add_noise,
+            #         return_noise=True,
+            #         return_image_latents=return_image_latents,
+            #     )
 
-                if return_image_latents:
-                    latent_sample, noise_sample, image_latents = latent_outputs
-                else:
-                    latent_sample, noise_sample = latent_outputs
+            #     if return_image_latents:
+            #         latent_sample, noise_sample, image_latents = latent_outputs
+            #     else:
+            #         latent_sample, noise_sample = latent_outputs
 
-                print("Latent vals : ", latent_sample.shape, latent_sample.max(), latent_sample.min())
+            #     print("Latent vals : ", latent_sample.shape, latent_sample.max(), latent_sample.min())
+            #     latent_samples.append(latent_sample)
+            #     noise_samples.append(noise_sample)
+            #     images_latents.append(image_latents)
+
+            for init_image in init_images:
+                latent_sample = self.encode_images(init_image.unsqueeze(0))      # 1 x 3 x 512 x 512 -> 1 x 4 x 64 x 64
                 latent_samples.append(latent_sample)
-                noise_samples.append(noise_sample)
-                images_latents.append(image_latents)
+
+            latent_samples = torch.cat(latent_samples, dim=0)       # 20 x 4 x 64 x 64
 
             print("Latents vals : ", latent_samples[0].shape, latent_samples[0].max(), latent_samples[0].min())
 
@@ -952,7 +950,7 @@ class DGEZestGuidance(DGEGuidance):
 
             masks, masked_images_latents = [
                 self.prepare_mask_latents(
-                mask,
+                mask.unsqueeze(0),    # 1 x 1 x 512 x 512
                 masked_image,
                 batch_size * num_images_per_prompt,
                 height,
@@ -1425,7 +1423,7 @@ class DGEZestGuidance(DGEGuidance):
         ).images
 
         print(images)
-        exit(0)
+        # exit(0)
 
 
         #######################################################

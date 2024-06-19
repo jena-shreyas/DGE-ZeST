@@ -17,6 +17,7 @@ import numpy as np
 import os
 from PIL import Image
 from rembg import remove
+from tqdm import tqdm
 
 
 def safe_normalize(x, eps=1e-20):
@@ -181,6 +182,7 @@ class GSLoadDataModuleConfig:
     # but OmegaConf does not support Union of containers
     source: str = None
     depth_path: str = None  # path to the depth maps
+    mask_path: str = None  # path to the masks
     height: Any = 512
     width: Any = 512
     batch_size: Any = 1
@@ -451,10 +453,10 @@ class GSZeST_load(pl.LightningDataModule):
         #     self.cfg.depth_path, h=self.cfg.eval_height, w=self.cfg.eval_width
         # )
 
-        self.train_scene_masks = self.compute_masks(
-            self.cfg.source, h=self.cfg.height, w=self.cfg.width
+        self.train_scene_masks = self.load_masks(
+            self.cfg.source, h=self.cfg.height, w=self.cfg.width, mask_path=self.cfg.mask_path
         )
-        # self.eval_scene_masks = self.compute_masks(
+        # self.eval_scene_masks = self.load_masks(
         #     self.cfg.source, h=self.cfg.eval_height, w=self.cfg.eval_width
         # )
         ####################################################################
@@ -476,9 +478,14 @@ class GSZeST_load(pl.LightningDataModule):
     def load_depths(self, depth_path, h, w) -> Dict[int, Any]:
 
         depth_maps = {}
-        for filename in os.listdir(depth_path):
+        print("Loading depth maps ...")
+        for filename in tqdm(os.listdir(depth_path)):
             if filename.endswith(".png"):
-                file_idx = int(filename.split(".")[0])
+                if "DSCF" in filename:
+                    file_idx = int(filename.split(".")[0].split("DSCF")[1]) - 656
+                    print(file_idx)
+                else:
+                    file_idx = int(filename.split(".")[0])
                 depth_map = Image.open(os.path.join(depth_path, filename))
                 np_image = np.array(depth_map)
                 np_image = (np_image / 256).astype('uint8')
@@ -488,13 +495,31 @@ class GSZeST_load(pl.LightningDataModule):
         return depth_maps
 
 
-    def compute_masks(self, source_path, h, w):
+    def load_masks(self, source_path, h, w, mask_path=None):
         
         masks = {}
+        os.makedirs(mask_path, exist_ok=True)
+        if len(os.listdir(mask_path)) > 0:
+            masks = {}
+            print("Loading masks ...")
+            for filename in tqdm(os.listdir(mask_path)):
+                if filename.endswith(".png") or filename.endswith(".jpg"):
+                    if "DSCF" in filename:
+                        file_idx = int(filename.split(".")[0].split("DSCF")[1]) - 656
+                        print(file_idx)
+                    else:
+                        file_idx = int(filename.split(".")[0])
+                    mask = Image.open(os.path.join(mask_path, filename)).convert("RGB").resize((w,h))
+                    masks[file_idx] = mask
 
-        for filename in os.listdir(os.path.join(source_path, "images")):
-            if filename.endswith(".png"):
-                file_idx = int(filename.split(".")[0])
+        else:
+            print("Computing masks ...")
+            for filename in tqdm(os.listdir(os.path.join(source_path, "images"))):
+                if "DSCF" in filename:
+                    file_idx = int(filename.split(".")[0].split("DSCF")[1]) - 656
+                    print(file_idx)
+                else:
+                    file_idx = int(filename.split(".")[0])
                 target_image_path = os.path.join(source_path, "images", filename)
                 target_image = Image.open(target_image_path).convert("RGB")
                 rm_bg = remove(target_image)
@@ -507,6 +532,7 @@ class GSZeST_load(pl.LightningDataModule):
                     .resize((w,h))
                 )  # Convert mask to grayscale
                 masks[file_idx] = mask
+                mask.save(os.path.join(mask_path, filename))
 
         return masks
 
