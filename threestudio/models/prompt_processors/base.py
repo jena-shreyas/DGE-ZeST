@@ -294,7 +294,7 @@ class PromptProcessor(BaseObject):
 
         self.direction2idx = {d.name: i for i, d in enumerate(self.directions)}
 
-        with open(os.path.join("load/prompt_library.json"), "r") as f:
+        with open(os.path.join("/data2/manan/DGE/load/prompt_library.json"), "r") as f:
             self.prompt_library = json.load(f)
         # use provided prompt or find prompt in library
         self.prompt = self.preprocess_prompt(self.cfg.prompt)

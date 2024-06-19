@@ -33,6 +33,8 @@ class LangSAMTextSegmentor(torch.nn.Module):
                 print(f"None {prompt} Detected")
                 masks.append(torch.zeros_like(images[0, 0:1]))
 
+        # mask_image = ToPILImage()(masks[0])
+        # mask_image.save("mask.png", "PNG")
         return torch.stack(masks, dim=0)
 
 
@@ -44,8 +46,12 @@ if __name__ == "__main__":
 
     image = ToTensor()(image)
 
+    print(image.shape)
     image = image.unsqueeze(0)
 
+    print(image.shape)    
     mask = model(image, prompt)
 
-    breakpoint()
+    print(mask.shape)
+
+    # breakpoint()

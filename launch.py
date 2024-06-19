@@ -102,6 +102,8 @@ def main(args, extras) -> None:
     # set a different seed for each device
     pl.seed_everything(cfg.seed + get_rank(), workers=True)
 
+    # Here, the train dataset is initialised as GSLoadIterableDataset
+    # It gets an argument max_num_view, which is the max. no. of views (20) RANDOMLY sampled as keyframes (prolly)
     dm = threestudio.find(cfg.data_type)(cfg.data)
     system: BaseSystem = threestudio.find(cfg.system_type)(
         cfg.system, resumed=cfg.resume is not None
@@ -189,8 +191,8 @@ def main(args, extras) -> None:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         system.set_resume_status(ckpt["epoch"], ckpt["global_step"])
 
-    if args.train:
-        trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
+    # Here, datamodule "dm" which has training and val data is passed to trainer for training
+    if args.trainre        trainer.fit(system, datamodule=dm, ckpt_path=cfg.resume)
         trainer.test(system, datamodule=dm)
         if args.gradio:
             # also export assets if in gradio mode

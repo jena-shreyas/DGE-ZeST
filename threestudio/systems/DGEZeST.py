@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageChops
 from tqdm import tqdm
 import cv2
 import numpy as np
@@ -25,10 +25,10 @@ from omegaconf import OmegaConf
 from argparse import ArgumentParser
 from threestudio.utils.misc import get_device
 from threestudio.utils.perceptual import PerceptualLoss
-from threestudio.utils.sam import LangSAMTextSegmentor
+# from threestudio.utils.sam import LangSAMTextSegmentor
 
-@threestudio.register("dge-system")
-class DGE(BaseLift3DSystem):
+@threestudio.register("dge-zest-system")
+class DGEZeST(BaseLift3DSystem):
     @dataclass
     class Config(BaseLift3DSystem.Config):
         gs_source: str = None
@@ -54,8 +54,6 @@ class DGE(BaseLift3DSystem):
         max_grad: float = 1e-7
         min_opacity: float = 0.005
 
-        seg_prompt: str = ""
-
         # cache
         cache_overwrite: bool = True
         cache_dir: str = ""
@@ -74,6 +72,9 @@ class DGE(BaseLift3DSystem):
         # guidance 
         camera_update_per_step: int = 500
         added_noise_schedule: List[int] = field(default_factory=[999, 200, 200, 21])    
+
+        # zest model ckpts
+        texture_path: str = "/data2/manan/DGE/data/textures/floral.png"
         
 
     cfg: Config
@@ -92,12 +93,15 @@ class DGE(BaseLift3DSystem):
         self.edit_frames = {}
         self.origin_frames = {}
         self.perceptual_loss = PerceptualLoss().eval().to(get_device())
-        self.text_segmentor = LangSAMTextSegmentor().to(get_device())
+        # self.text_segmentor = LangSAMTextSegmentor().to(get_device())
 
         if len(self.cfg.cache_dir) > 0:
             self.cache_dir = os.path.join("edit_cache", self.cfg.cache_dir)
         else:
             self.cache_dir = os.path.join("edit_cache", self.cfg.gs_source.replace("/", "-"))
+
+        #### SETUP ZEST MODELS ####
+        #### SETUP ZEST MODELS ####
 
     @torch.no_grad()
     def update_mask(self, save_name="mask") -> None:
@@ -521,11 +525,45 @@ class DGE(BaseLift3DSystem):
 
         return ret
     
+    def prepare_rendered_image(
+            self,
+            image: torch.Tensor, 
+            mask: Image, 
+            ) -> Image.Image:
+        
+        # assert image.max() <= 1.0 and image.min() >= 0.0, "Image should be normalized between 0 and 1.0"
+        out = np.array(image[0].cpu().detach().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
+        print(out.max(), out.min())         # 255, 1
+        target_image = Image.fromarray(out)  # convert to PIL image 
+
+        gray_target_image = target_image.convert('L').convert('RGB')
+        gray_target_image = ImageEnhance.Brightness(gray_target_image)
+
+        # Adjust brightness
+        # The factor 1.0 means original brightness, greater than 1.0 makes the image brighter. Adjust this if the image is too dim
+        factor = 1.0  # Try adjusting this to get the desired brightness
+
+        invert_mask = ImageChops.invert(mask)
+        gray_target_image = gray_target_image.enhance(factor)
+        grayscale_img = ImageChops.darker(gray_target_image, mask)
+        img_black_mask = ImageChops.darker(target_image, invert_mask)
+        grayscale_init_img = ImageChops.lighter(img_black_mask, grayscale_img)
+        init_img = grayscale_init_img
+        y = torch.randint(0, 512, (1,)).item()
+        init_img.save(f'grayscale_rendered_image_{y}.png')
+        # out = torch.tensor(
+        #     np.array(init_img) / 255.0, device="cuda", dtype=torch.float32
+        # )[None]     # 1 x 512 x 512 x 3
+
+        return init_img
+
+    
     def edit_all_view(self, original_render_name, cache_name, update_camera=False, global_step=0):
         if self.true_global_step >= self.cfg.camera_update_per_step:
             self.guidance.use_normal_unet()
         
         self.edited_cams = []
+        # If, you wish to change the camera view list to be edited
         if update_camera:
             self.trainer.datamodule.train_dataset.update_cameras(random_seed = global_step + 1)
             self.view_list = self.trainer.datamodule.train_dataset.n2n_view_index   # 20 views
@@ -541,7 +579,9 @@ class DGE(BaseLift3DSystem):
         os.makedirs(cache_dir, exist_ok=True)
 
         cameras = []        # list of camera objects
-        images = []    # List of images rendered from 3D model for each camera view
+        images: List[Image.Image] = []    # List of images rendered from 3D model for each camera view
+        depths: List[Image.Image] = []
+        masks: List[Image.Image] = []
         original_frames = []
         t_max_step = self.cfg.added_noise_schedule
         self.guidance.max_step = t_max_step[min(len(t_max_step)-1, self.true_global_step//self.cfg.camera_update_per_step)]
@@ -549,7 +589,7 @@ class DGE(BaseLift3DSystem):
             for id in self.view_list:
                 cameras.append(self.trainer.datamodule.train_dataset.scene.cameras[id])
             sorted_cam_idx : List[int] = self.sort_the_cameras_idx(cameras)     # sorts the camera indices in view_list based on some ordering on the camera parameters
-            view_sorted = [self.view_list[idx] for idx in sorted_cam_idx]   # 
+            view_sorted = [self.view_list[idx] for idx in sorted_cam_idx]   # len = 20
             cams_sorted = [cameras[idx] for idx in sorted_cam_idx]     
                    
             # For the sorted views, render the images and store them in the cache
@@ -557,11 +597,16 @@ class DGE(BaseLift3DSystem):
                 cur_path = os.path.join(cache_dir, "{:0>4d}.png".format(id))
                 original_image_path = os.path.join(original_render_cache_dir, "{:0>4d}.png".format(id))
                 cur_cam = self.trainer.datamodule.train_dataset.scene.cameras[id]
+                                
+                # For ZeST-based guidance
+                depth = self.trainer.datamodule.train_dataset.depths[id]
+                mask = self.trainer.datamodule.train_dataset.masks[id]
+                
                 cur_batch = {
                     "index": id,
                     "camera": [cur_cam],
                     "height": self.trainer.datamodule.train_dataset.height,
-                    "width": self.trainer.datamodule.train_dataset.width
+                    "width": self.trainer.datamodule.train_dataset.width,
                 }
                 out_pkg = self(cur_batch)
                 out = out_pkg["comp_rgb"]
@@ -574,27 +619,60 @@ class DGE(BaseLift3DSystem):
 
                 if self.cfg.use_masked_image:
                     out = out * out_pkg["masks"].unsqueeze(-1)
+
+                ### TODO: Convert rendered image into FG-grayscale rendered imag
+                # out: torch.Tensor (1, H, W, C)
+                # apply transformations for fg-grayscale image
+
+                out: Image.Image = self.prepare_rendered_image(out, mask)
                 images.append(out)
+                ##########
+
                 assert os.path.exists(original_image_path)
                 cached_image = cv2.cvtColor(cv2.imread(original_image_path), cv2.COLOR_BGR2RGB)
-                self.origin_frames[id] = torch.tensor(
+                self.origin_frames[id] = torch.tensor(          # conditioning original image is normalized here
                     cached_image / 255, device="cuda", dtype=torch.float32
                 )[None]
                 original_frames.append(self.origin_frames[id])
-            images = torch.cat(images, dim=0)
-            original_frames = torch.cat(original_frames, dim=0)     # 20 x 512 x 512 x 3
+
+                if depth is not None and mask is not None:
+                    # convert depth and mask from PIL images to torch tensors
+                    # depth = torch.tensor(
+                    #     np.array(depth), device="cuda", dtype=torch.float32
+                    # )[None]     # 1 x 1024 x 1024 (grayscale img)
+                    # mask = torch.tensor(
+                    #     np.array(mask), device="cuda", dtype=torch.float32
+                    # )[None]     # 1 x 1024 x 1024 x 3
+                    depths.append(depth)        
+                    masks.append(mask)
+
+            # images = torch.cat(images, dim=0)           # 20 x 512 x 512 x 3
+            ### TODO: Replace original_frames with texture exemplar image (load it in DataModuleConfig and initialize it)
+            #######################
+
+            # original_frames = torch.cat(original_frames, dim=0)     # 20 x 512 x 512 x 3
+            texture_exemplar = Image.open(self.cfg.texture_path)    # PIL Image
+            # texture_exemplar = torch.tensor(texture_exemplar / 255.0, device="cuda", dtype=torch.float32)[None]   # 1 x H X W X C
+
+            #######################
+            # depths = torch.cat(depths, dim=0)           # 20 x 1024 x 1024
+            # masks = torch.cat(masks, dim=0)             # 20 x 1024 x 1024 x 3
+            # print("Input shapes : ", texture_exemplar.shape, depths.shape, masks.shape)
 
             #######
             # HERE, REPLACE WITH ZEST GUIDED IMAGES INSTEAD
             #######
-            #############
+            # Extra params (not for IP-Adapter but for SDXL+Inpaint)
+            # image, control_image, mask_image, controlnet_conditioning_scale
             edited_images = self.guidance(
-                images,
-                original_frames,
-                self.prompt_processor(),
+                images=images,             # image to be edited (replace with FG-grayscaled rendered image)
+                texture_exemplar=texture_exemplar,   # texture exemplar image
                 cams = cams_sorted,
+                depths = depths,
+                masks = masks,
+                seed = 42
             )
-
+            
             for view_index_tmp in range(len(self.view_list)):
                 self.edit_frames[view_sorted[view_index_tmp]] = edited_images['edit_images'][view_index_tmp].unsqueeze(0).detach().clone() # 1 H W C
     
@@ -616,13 +694,14 @@ class DGE(BaseLift3DSystem):
         super().on_fit_start()
         self.render_all_view(cache_name="origin_render")
 
-        if len(self.cfg.seg_prompt) > 0:
-            self.update_mask()
+        # if len(self.cfg.seg_prompt) > 0:
+        #     self.update_mask()
 
-        if len(self.cfg.prompt_processor) > 0:
-            self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
-                self.cfg.prompt_processor
-            )
+        # if len(self.cfg.prompt_processor) > 0:
+        #     self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
+        #         self.cfg.prompt_processor
+        #     )
+        
         if self.cfg.loss.lambda_l1 > 0 or self.cfg.loss.lambda_p > 0 or self.cfg.loss.use_sds:
             self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
             
@@ -631,7 +710,7 @@ class DGE(BaseLift3DSystem):
         # Every 500 steps, for each view in n2n_view_index, make a fresh DGE text-guided edit of those views
         # Use them as reference and compare the rendered image with the edited images
         # Each training step 
-        if self.true_global_step % self.cfg.camera_update_per_step == 0 and self.cfg.guidance_type == 'dge-guidance' and not self.cfg.loss.use_sds:
+        if self.true_global_step % self.cfg.camera_update_per_step == 0 and self.cfg.guidance_type == 'dge-zest-guidance' and not self.cfg.loss.use_sds:
             self.edit_all_view(original_render_name='origin_render', cache_name="edited_views", update_camera=self.true_global_step >= self.cfg.camera_update_per_step, global_step=self.true_global_step) 
     
         self.gaussian.update_learning_rate(self.true_global_step)
@@ -665,6 +744,7 @@ class DGE(BaseLift3DSystem):
                         and self.global_step % self.cfg.per_editing_step == 0
                 )) and 'dge' not in str(self.cfg.guidance_type) and not self.cfg.loss.use_sds:
                     print(self.cfg.guidance_type)
+                    ### REPLACE prompt inputs with the ZeST input
                     result = self.guidance(
                         images[img_index][None],
                         self.origin_frames[cur_index],

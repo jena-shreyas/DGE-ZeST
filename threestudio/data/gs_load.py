@@ -14,6 +14,10 @@ from threestudio.utils.config import parse_structured
 from threestudio.utils.typing import *
 import numpy as np
 
+import os
+from PIL import Image
+from rembg import remove
+
 
 def safe_normalize(x, eps=1e-20):
     return x / torch.sqrt(torch.clamp(torch.sum(x * x, -1, keepdim=True), min=eps))
@@ -176,6 +180,7 @@ class GSLoadDataModuleConfig:
     # height, width, and batch_size should be Union[int, List[int]]
     # but OmegaConf does not support Union of containers
     source: str = None
+    depth_path: str = None  # path to the depth maps
     height: Any = 512
     width: Any = 512
     batch_size: Any = 1
@@ -210,10 +215,12 @@ class GSLoadDataModuleConfig:
 
 
 class GSLoadIterableDataset(IterableDataset, Updateable):
-    def __init__(self, cfg, scene) -> None:
+    def __init__(self, cfg, scene, depths=None, masks=None) -> None:
         super().__init__()
         self.cfg: GSLoadDataModuleConfig = cfg
         self.scene = scene
+        self.depths = depths
+        self.masks = masks
         self.total_view_num = len(self.scene.cameras)
         random.seed(0)  # make sure same views
         self.n2n_view_index = random.sample(
@@ -256,12 +263,16 @@ class GSLoadIterableDataset(IterableDataset, Updateable):
     def collate(self, batch) -> Dict[str, Any]:
         cam_list = []
         index_list = []
+        depth_list = []
+        mask_list = []
         for _ in range(self.batch_size):
             if not self.view_index_stack:
                 self.view_index_stack = self.n2n_view_index.copy()
             view_index = random.choice(self.view_index_stack)
             self.view_index_stack.remove(view_index)
             cam_list.append(self.scene.cameras[view_index])
+            depth_list.append(self.depths[view_index])
+            mask_list.append(self.masks[view_index])
             index_list.append(view_index)
 
         return {
@@ -269,6 +280,8 @@ class GSLoadIterableDataset(IterableDataset, Updateable):
             "camera": cam_list,
             "height": self.height,
             "width": self.width,
+            "depth": depth_list,
+            "mask": mask_list
         }
 
     # def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
@@ -283,6 +296,7 @@ class GSLoadIterableDataset(IterableDataset, Updateable):
     #     # progressive view
     #     self.progressive_view(global_step)
 
+    # allows for an update of the views which are to be edited
     def update_cameras(self, random_seed: int = 0):
         random.seed(random_seed)
         self.n2n_view_index = random.sample(
@@ -374,6 +388,129 @@ class GS_load(pl.LightningDataModule):
 
     def prepare_data(self):
         pass
+
+    def general_loader(self, dataset, batch_size, collate_fn=None) -> DataLoader:
+        return DataLoader(
+            dataset,
+            # very important to disable multi-processing if you want to change self attributes at runtime!
+            # (for example setting self.width and self.height in update_step)
+            num_workers=0,  # type: ignore
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+        )
+
+    def train_dataloader(self) -> DataLoader:
+        return self.general_loader(
+            self.train_dataset, batch_size=None, collate_fn=self.train_dataset.collate
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return self.general_loader(
+            self.val_dataset,
+            batch_size=1,
+            collate_fn=self.val_dataset.collate,
+        )
+        # return self.general_loader(self.train_dataset, batch_size=None, collate_fn=self.train_dataset.collate)
+
+    def test_dataloader(self) -> DataLoader:
+        return self.general_loader(
+            self.test_dataset, batch_size=1, collate_fn=self.test_dataset.collate
+        )
+
+    def predict_dataloader(self) -> DataLoader:
+        return self.general_loader(
+            self.test_dataset, batch_size=1, collate_fn=self.test_dataset.collate
+        )
+    
+
+@register("gs-zest-load")
+class GSZeST_load(pl.LightningDataModule):
+    cfg: GSLoadDataModuleConfig
+
+    def __init__(self, cfg: Optional[Union[dict, DictConfig]] = None) -> None:
+        from gaussiansplatting.scene.camera_scene import CamScene
+
+        super().__init__()
+        self.cfg = parse_structured(GSLoadDataModuleConfig, cfg)
+        if self.cfg.use_original_resolution:
+            self.cfg.height = self.cfg.eval_height
+            self.cfg.width = self.cfg.eval_width
+        
+        self.train_scene = CamScene(
+            self.cfg.source, h=self.cfg.height, w=self.cfg.width
+        )
+        self.eval_scene = CamScene(
+            self.cfg.source, h=self.cfg.eval_height, w=self.cfg.eval_width
+        )
+
+        #### ADD EXTRA INPUTS FOR MASKS AND DEPTH MAPS HERE (FOR ZEST) ###
+        self.train_scene_depths = self.load_depths(
+            self.cfg.depth_path, h=self.cfg.height, w=self.cfg.width
+        )
+        # self.eval_scene_depths = self.load_depths(
+        #     self.cfg.depth_path, h=self.cfg.eval_height, w=self.cfg.eval_width
+        # )
+
+        self.train_scene_masks = self.compute_masks(
+            self.cfg.source, h=self.cfg.height, w=self.cfg.width
+        )
+        # self.eval_scene_masks = self.compute_masks(
+        #     self.cfg.source, h=self.cfg.eval_height, w=self.cfg.eval_width
+        # )
+        ####################################################################
+
+    def setup(self, stage=None) -> None:
+        # add the masks and depth maps here
+        if stage in [None, "fit"]:
+            self.train_dataset = GSLoadIterableDataset(self.cfg, self.train_scene, self.train_scene_depths, self.train_scene_masks)
+        if stage in [None, "fit", "validate"]:
+            self.val_dataset = GSLoadDataset(
+                self.cfg, "val", self.eval_scene, self.train_dataset.n2n_view_index
+            )
+        if stage in [None, "test", "predict"]:
+            self.test_dataset = GSLoadDataset(self.cfg, "test", self.eval_scene)
+
+    def prepare_data(self):
+        pass
+
+    def load_depths(self, depth_path, h, w) -> Dict[int, Any]:
+
+        depth_maps = {}
+        for filename in os.listdir(depth_path):
+            if filename.endswith(".png"):
+                file_idx = int(filename.split(".")[0])
+                depth_map = Image.open(os.path.join(depth_path, filename))
+                np_image = np.array(depth_map)
+                np_image = (np_image / 256).astype('uint8')
+                depth_map = Image.fromarray(np_image).resize((w,h))
+                depth_maps[file_idx] = depth_map
+
+        return depth_maps
+
+
+    def compute_masks(self, source_path, h, w):
+        
+        masks = {}
+
+        for filename in os.listdir(os.path.join(source_path, "images")):
+            if filename.endswith(".png"):
+                file_idx = int(filename.split(".")[0])
+                target_image_path = os.path.join(source_path, "images", filename)
+                target_image = Image.open(target_image_path).convert("RGB")
+                rm_bg = remove(target_image)
+                # output.save(output_path)
+                mask = (
+                    rm_bg.convert("RGB")
+                    .point(lambda x: 0 if x < 1 else 255)
+                    .convert("L")
+                    .convert("RGB")
+                    .resize((w,h))
+                )  # Convert mask to grayscale
+                masks[file_idx] = mask
+
+        return masks
+
+
 
     def general_loader(self, dataset, batch_size, collate_fn=None) -> DataLoader:
         return DataLoader(

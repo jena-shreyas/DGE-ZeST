@@ -1,0 +1,5 @@
+.threestudio_cache/
+data/
+edit_cache/
+outputs/
+*__pycache__/*
