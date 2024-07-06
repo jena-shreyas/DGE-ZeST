@@ -141,12 +141,12 @@ class IPAdapter:
         if pil_image is not None:
             if isinstance(pil_image, Image.Image):
                 pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
+            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values      # 1,3,224,224
+            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds       # 1,1024
         else:
             clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
-        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+        image_prompt_embeds = self.image_proj_model(clip_image_embeds)          # 1,4,768
+        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))     # 1,4,768
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def set_scale(self, scale):

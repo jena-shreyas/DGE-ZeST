@@ -53,10 +53,10 @@ system:
   guidance_type: "dge-zest-guidance"
   guidance:
     # zest model paths
-    base_model_path: "stabilityai/stable-diffusion-xl-base-1.0"
+    base_model_path: "runwayml/stable-diffusion-v1-5"        # "stabilityai/stable-diffusion-xl-base-1.0"
     image_encoder_path: "/data2/manan/zest_code/models/image_encoder"
-    ip_ckpt: "/data2/manan/zest_code/sdxl_models/ip-adapter_sdxl_vit-h.bin"
-    controlnet_path: "diffusers/controlnet-depth-sdxl-1.0"
+    ip_ckpt: "/data2/manan/zest_code/models/ip-adapter_sd15.bin"     # "/data2/manan/zest_code/sdxl_models/ip-adapter_sdxl_vit-h.bin"
+    controlnet_path: "lllyasviel/control_v11f1p_sd15_depth"     # "diffusers/controlnet-depth-sdxl-1.0" 
     controlnet_conditioning_scale: 0.9
     num_inference_steps: 30
     enable_memory_efficient_attention: True

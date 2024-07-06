@@ -528,6 +528,7 @@ class CNAttnProcessor2_0:
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 
+        # Query shape : 2,4096,320   
         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)

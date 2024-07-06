@@ -181,8 +181,8 @@ class GSLoadDataModuleConfig:
     # height, width, and batch_size should be Union[int, List[int]]
     # but OmegaConf does not support Union of containers
     source: str = None
-    depth_path: str = None  # path to the depth maps
-    mask_path: str = None  # path to the masks
+    depth_path: Any = None  # path to the depth maps
+    mask_path: Any = None  # path to the masks
     height: Any = 512
     width: Any = 512
     batch_size: Any = 1
@@ -273,18 +273,27 @@ class GSLoadIterableDataset(IterableDataset, Updateable):
             view_index = random.choice(self.view_index_stack)
             self.view_index_stack.remove(view_index)
             cam_list.append(self.scene.cameras[view_index])
-            depth_list.append(self.depths[view_index])
-            mask_list.append(self.masks[view_index])
+            if self.depths is not None:
+                depth_list.append(self.depths[view_index])
+            if self.masks is not None:
+                mask_list.append(self.masks[view_index])
             index_list.append(view_index)
-
-        return {
-            "index": index_list,
-            "camera": cam_list,
-            "height": self.height,
-            "width": self.width,
-            "depth": depth_list,
-            "mask": mask_list
-        }
+        if len(depth_list) > 0 and len(mask_list) > 0:
+            return {
+                "index": index_list,
+                "camera": cam_list,
+                "height": self.height,
+                "width": self.width,
+                "depth": depth_list,
+                "mask": mask_list
+            }
+        else:
+            return {
+                "index": index_list,
+                "camera": cam_list,
+                "height": self.height,
+                "width": self.width,
+            }
 
     # def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
     #     size_ind = bisect.bisect_right(self.resolution_milestones, global_step) - 1

@@ -263,48 +263,64 @@ def register_extended_attention(model):
         else:
             to_out = self.to_out
         def forward(x, encoder_hidden_states=None, attention_mask=None):
-            assert encoder_hidden_states is None 
-            batch_size, sequence_length, dim = x.shape
-            h = self.heads
-            n_frames = batch_size // 3
+            '''
+            NOTE:
+              x = pixel-wise embeddings of latents
+              encoder_hidden_states = prompt embeddings (or, latent pixels itself)
+
+              In cross attention, prompt embeddings form the key and value, and pixel-wise embeddings form the query.
+              This gives a pixel-wise correspondence/grounding with each word in the prompt. For ZeST, since self-attention between pixel embeddings is used instead, the prompt embeddings are not used.
+            '''
+            assert encoder_hidden_states is None        # For ZeST, self-attention between pixel embeddings is used 
+            batch_size, sequence_length, dim = x.shape      # 8,4096,320
+            h = self.heads      # 8
+
+            # For ZeST (i.e., SDXl), there is only text (condition) and uncond input. So, divide the batch size by 2
+            n_frames = batch_size // 2          # 3
             is_cross = encoder_hidden_states is not None
             encoder_hidden_states = encoder_hidden_states if is_cross else x
-            q = self.to_q(x)
+            q = self.to_q(x)                            # 8,4096,320 -> 8,4096,320 each
             k = self.to_k(encoder_hidden_states)
             v = self.to_v(encoder_hidden_states)
             
+            '''
+            TODO: Make this code usable for both normal DGE (IP2P) and ZeST (SD-1.5)
+            '''
             k_text = k[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            k_uncond = k[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            # k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            # k_uncond = k[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            k_uncond = k[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
 
             v_text = v[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            v_image = v[n_frames:2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            v_uncond = v[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            # v_image = v[n_frames:2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            # v_uncond = v[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            v_uncond = v[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
 
             q_text = self.head_to_batch_dim(q[:n_frames])
-            q_image = self.head_to_batch_dim(q[n_frames: 2*n_frames])
-            q_uncond = self.head_to_batch_dim(q[2 * n_frames:])
+            # q_image = self.head_to_batch_dim(q[n_frames: 2*n_frames])
+            # q_uncond = self.head_to_batch_dim(q[2 * n_frames:])
+            q_uncond = self.head_to_batch_dim(q[n_frames:])
 
             k_text = self.head_to_batch_dim(k_text)
-            k_image = self.head_to_batch_dim(k_image)
+            # k_image = self.head_to_batch_dim(k_image)
             k_uncond = self.head_to_batch_dim(k_uncond)
 
             
             v_text = self.head_to_batch_dim(v_text)
-            v_image = self.head_to_batch_dim(v_image)
+            # v_image = self.head_to_batch_dim(v_image)
             v_uncond = self.head_to_batch_dim(v_uncond)
 
             out_text = []
-            out_image = []
+            # out_image = []
             out_uncond = []
 
             q_text = q_text.view(n_frames, h, sequence_length, dim // h)
             k_text = k_text.view(n_frames, h, sequence_length * n_frames, dim // h)
             v_text = v_text.view(n_frames, h, sequence_length * n_frames, dim // h)
 
-            q_image = q_image.view(n_frames, h, sequence_length, dim // h)
-            k_image = k_image.view(n_frames, h, sequence_length * n_frames, dim // h)
-            v_image = v_image.view(n_frames, h, sequence_length * n_frames, dim // h)
+            # q_image = q_image.view(n_frames, h, sequence_length, dim // h)
+            # k_image = k_image.view(n_frames, h, sequence_length * n_frames, dim // h)
+            # v_image = v_image.view(n_frames, h, sequence_length * n_frames, dim // h)
 
             q_uncond = q_uncond.view(n_frames, h, sequence_length, dim // h)
             k_uncond = k_uncond.view(n_frames, h, sequence_length * n_frames, dim // h)
@@ -312,18 +328,19 @@ def register_extended_attention(model):
 
             for j in range(h):
                 sim_text = torch.bmm(q_text[:, j], k_text[:, j].transpose(-1, -2)) * self.scale
-                sim_image = torch.bmm(q_image[:, j], k_image[:, j].transpose(-1, -2)) * self.scale
+                # sim_image = torch.bmm(q_image[:, j], k_image[:, j].transpose(-1, -2)) * self.scale
                 sim_uncond = torch.bmm(q_uncond[:, j], k_uncond[:, j].transpose(-1, -2)) * self.scale
                 
                 out_text.append(torch.bmm(sim_text.softmax(dim=-1), v_text[:, j]))
-                out_image.append(torch.bmm(sim_image.softmax(dim=-1), v_image[:, j]))
+                # out_image.append(torch.bmm(sim_image.softmax(dim=-1), v_image[:, j]))
                 out_uncond.append(torch.bmm(sim_uncond.softmax(dim=-1), v_uncond[:, j]))
 
             out_text = torch.cat(out_text, dim=0).view(h, n_frames, sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
-            out_image = torch.cat(out_image, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
+            # out_image = torch.cat(out_image, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
             out_uncond = torch.cat(out_uncond, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
 
-            out = torch.cat([out_text, out_image, out_uncond], dim=0)
+            # out = torch.cat([out_text, out_image, out_uncond], dim=0)
+            out = torch.cat([out_text, out_uncond], dim=0)
             out = self.batch_to_head_dim(out)
 
             return to_out(out)
@@ -349,18 +366,20 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     class DGEBlock(block_class):
         def forward(
             self,
-            hidden_states,
+            hidden_states,                      # 2,B,4096,320  (Latent Pixel-wise embeddings)    
             attention_mask=None,
-            encoder_hidden_states=None,
+            encoder_hidden_states=None,         # 2B,81,768    (Prompt embeds)
             encoder_attention_mask=None,
             timestep=None,
             cross_attention_kwargs=None,
             class_labels=None,
         ) -> torch.Tensor:
             
-            batch_size, sequence_length, dim = hidden_states.shape
-            n_frames = batch_size // 3
-            hidden_states = hidden_states.view(3, n_frames, sequence_length, dim)
+            # hidden states : pixel-wise embeddings (dim=320) of each pixel in 64x64 latent
+            # Reshape 8 -> 2,4 (two rows of replicas of the same 4 frames)
+            batch_size, sequence_length, dim = hidden_states.shape      # 8,4096,320          # Normal DGE : 3,4096,320
+            n_frames = batch_size // 2      # 3
+            hidden_states = hidden_states.view(2, n_frames, sequence_length, dim)   # 2,4,4096,320  (Actual : 3)
 
             if self.use_ada_layer_norm:
                 norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -371,22 +390,31 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             else:
                 norm_hidden_states = self.norm1(hidden_states)
         
-            norm_hidden_states = norm_hidden_states.view(3, n_frames, sequence_length, dim)
+            norm_hidden_states = norm_hidden_states.view(2, n_frames, sequence_length, dim)  # 3
             if self.pivotal_pass:
-                self.pivot_hidden_states = norm_hidden_states
+                self.pivot_hidden_states = norm_hidden_states       
             if not hasattr(self, 'use_normal_attn'):
                 if self.pivotal_pass:
-                    self.pivot_hidden_states = norm_hidden_states
+                    self.pivot_hidden_states = norm_hidden_states       # 2,4,4096,320
                 else:
+                    '''
+                    NOTE:
+                        When self.pivotal_pass is True, self.pivot_hidden_states is initialized to norm_hidden_states of the pivotal frames.
+                        Hence, before batched forward pass, a single forward pass step (just before Line with register_pivotal=False in edit_zest_latents())
+                        is done to initialize self.pivot_hidden_states. 
+
+                        Next, when pivotal_pass is False,
+                        Now, batched inputs are passed here, and self.pivot_hidden_states is used to get the closest cam pivot hidden states in this block.
+                    '''
                     batch_idxs = [self.batch_idx]
                     if self.batch_idx > 0:
                         batch_idxs.append(self.batch_idx - 1)
                     idx1 = []
                     idx2 = []
-                    cam_distance = compute_camera_distance(self.cams, self.key_cams)
+                    cam_distance = compute_camera_distance(self.cams, self.key_cams)        # shape : 20,4
                     cam_distance_min = cam_distance.sort(dim=-1)
                     closest_cam = cam_distance_min[1][:,:len(batch_idxs)]
-                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[1][closest_cam]
+                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[1][closest_cam]      # 20,1,4096,320
                     sim = torch.einsum('bld,bcsd->bcls', norm_hidden_states[1] / norm_hidden_states[1].norm(dim=-1, keepdim=True), closest_cam_pivot_hidden_states / closest_cam_pivot_hidden_states.norm(dim=-1, keepdim=True)).squeeze()
                         
                     if len(batch_idxs) == 2:
@@ -466,19 +494,22 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         **cross_attention_kwargs,
                     )         
             else:
+                '''
+                NOTE: Control entered here during the first pivotal pass.
+                '''
                 if self.pivotal_pass:
                     # norm_hidden_states.shape = 3, n_frames * seq_len, dim
                     self.attn_output = self.attn1(
                             norm_hidden_states.view(batch_size, sequence_length, dim),
-                            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,     # None
                             **cross_attention_kwargs,
                         )
                     # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
-                    self.kf_attn_output = self.attn_output
+                    self.kf_attn_output = self.attn_output      # Store the key frame attention outputs in the first pivotal pass
 
                 else:
                     batch_kf_size, _, _ = self.kf_attn_output.shape
-                    self.attn_output = self.kf_attn_output.view(3, batch_kf_size // 3, sequence_length, dim)[:,
+                    self.attn_output = self.kf_attn_output.view(2, batch_kf_size // 2, sequence_length, dim)[:,     # 3
                                     closest_cam]
 
             if self.use_ada_layer_norm_zero:
@@ -487,33 +518,33 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             # gather values from attn_output, using idx as indices, and get a tensor of shape 3, n_frames, seq_len, dim
             if not hasattr(self, 'use_normal_attn'):
                 if not self.pivotal_pass:
-                    if len(batch_idxs) == 2:
+                    if len(batch_idxs) == 2:            # Normal DGE : batch_idxs = [0] (len = 1)
                         attn_1, attn_2 = self.attn_output[:, :, 0], self.attn_output[:, :, 1]
-                        idx1 = idx1.view(3, n_frames, sequence_length)
-                        idx2 = idx2.view(3, n_frames, sequence_length)
+                        idx1 = idx1.view(2, n_frames, sequence_length)          # 2, n_frames, 4096
+                        idx2 = idx2.view(2, n_frames, sequence_length)
                         attn_output1 = attn_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output2 = attn_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
-                        d1 = cam_distance_min[0][:,0]
-                        d2 = cam_distance_min[0][:,1]
-                        w1 = d2 / (d1 + d2)
+                        d1 = cam_distance_min[0][:,0]           # 20,1  (closest key cam distance)
+                        d2 = cam_distance_min[0][:,1]           # 20,1  (2nd closest key cam distance)
+                        w1 = d2 / (d1 + d2)                     # average the two closest key cam distances
                         w1 = torch.sigmoid(w1)
-                        w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(3, 1, sequence_length, dim)
-                        attn_output1 = attn_output1.view(3, n_frames, sequence_length, dim)
-                        attn_output2 = attn_output2.view(3, n_frames, sequence_length, dim)
+                        w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(2, 1, sequence_length, dim)     # // 3
+                        attn_output1 = attn_output1.view(2, n_frames, sequence_length, dim)     # // 3
+                        attn_output2 = attn_output2.view(2, n_frames, sequence_length, dim)     # // 3
                         attn_output = w1 * attn_output1 + (1 - w1) * attn_output2
                         attn_output = attn_output.reshape(
                             batch_size, sequence_length, dim).half()
                     else:
-                        idx1 = idx1.view(3, n_frames, sequence_length)
+                        idx1 = idx1.view(2, n_frames, sequence_length)      # 3    2, n_frames, 4096
                         attn_output = self.attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output = attn_output.reshape(batch_size, sequence_length, dim).half()                       
-                else:
+                else:   #pivotal pass
                     attn_output = self.attn_output
             else:
                 attn_output = self.attn_output
             
             
-            hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 3 * n_frames, seq_len, dim
+            hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 3,4096,320   -> Next pass: 3,1024,640
             hidden_states = attn_output + hidden_states
             hidden_states = hidden_states.to(self.norm2.weight.dtype)
             if self.attn2 is not None:
