@@ -156,20 +156,25 @@ def compute_epipolar_constrains(cam1, cam2, current_H=64, current_W=64):
     sequence_length = current_W * current_H
     fundamental_matrix_1 = []
     
-    fundamental_matrix_1.append(get_fundamental_matrix_with_H(cam1, cam2, current_H, current_W))
-    fundamental_matrix_1 = torch.stack(fundamental_matrix_1, dim=0)
+    fundamental_matrix_1.append(get_fundamental_matrix_with_H(cam1, cam2, current_H, current_W))        # fundamental matrix has very large values (1e+6 range!)
+    fundamental_matrix_1 = torch.stack(fundamental_matrix_1, dim=0)     # 1,3,3
 
-    x = torch.arange(current_W)
+    x = torch.arange(current_W)     # 0,1,...,64
     y = torch.arange(current_H)
-    x, y = torch.meshgrid(x, y, indexing='xy')
-    x = x.reshape(-1)
-    y = y.reshape(-1)
-    heto_cam2 = torch.stack([x, y, torch.ones(size=(len(x),))], dim=1).view(-1, 3).cuda()
+    x, y = torch.meshgrid(x, y, indexing='xy')      # 64x64
+    x = x.reshape(-1)       # 4096
+    y = y.reshape(-1)       # 4096
+
+    # 0,0,1
+    # 1,0,1         heto_cam : Column-wise ordering of latent pixels (homogeneous coords)
+    # ....
+    # 63,63,1
+    heto_cam2 = torch.stack([x, y, torch.ones(size=(len(x),))], dim=1).view(-1, 3).cuda()                   # 4096,3
     heto_cam1 = torch.stack([x, y, torch.ones(size=(len(x),))], dim=1).view(-1, 3).cuda()
     # epipolar_line: n_frames X seq_len,  3
-    line1 = (heto_cam2.unsqueeze(0).repeat(n_frames, 1, 1) @ fundamental_matrix_1.cuda()).view(-1, 3)
-    
-    distance1 = point_to_line_dist(heto_cam1, line1)
+    line1 = (heto_cam2.unsqueeze(0).repeat(n_frames, 1, 1) @ fundamental_matrix_1.cuda()).view(-1, 3)       # 4096,3
+    # line1 has inf, -inf, nan values (in normal DGE, DGE+ZeST)!! 
+    distance1 = point_to_line_dist(heto_cam1, line1)        # 4096,4096 (nan values in DGE, DGE+ZeST! (Is this expected?))
 
     
     idx1_epipolar = distance1 > 1 # sequence_length x sequence_lengths
@@ -216,6 +221,18 @@ def register_t(diffusion_model, t):
         if isinstance_str(module, "BasicTransformerBlock"):
             setattr(module, "t", t)
 
+### NEW FUNCTIONS FOR ZEST ###
+def register_conditioning_factor(diffusion, conditioning_factor):
+
+    for _, module in diffusion.named_modules():
+        if isinstance_str(module, "BasicTransformerBlock"):
+            setattr(module, "conditioning_factor", conditioning_factor)
+
+            '''TODO: Maybe also add this factor as a attention layer-level attribute too, since also needed in extended_attention()
+            '''
+
+            if hasattr(module, 'attn1'):
+                setattr(module.attn1, "conditioning_factor", conditioning_factor)
 
 def register_normal_attention(model):
     def sa_forward(self):
@@ -276,72 +293,90 @@ def register_extended_attention(model):
             h = self.heads      # 8
 
             # For ZeST (i.e., SDXl), there is only text (condition) and uncond input. So, divide the batch size by 2
-            n_frames = batch_size // 2          # 3
+            factor = self.conditioning_factor
+            assert factor in [2,3]          # Support both SD-1.5 and IP2P
+            n_frames = batch_size // factor          # 3
             is_cross = encoder_hidden_states is not None
-            encoder_hidden_states = encoder_hidden_states if is_cross else x
-            q = self.to_q(x)                            # 8,4096,320 -> 8,4096,320 each
+            encoder_hidden_states = encoder_hidden_states if is_cross else x        # 8,4096,320
+            q = self.to_q(x)                            # 8,4096,320 ... 8,1024, 640 -> 8,4096,320 each
             k = self.to_k(encoder_hidden_states)
             v = self.to_v(encoder_hidden_states)
             
             '''
+            NOTE: This replicating key and value tensors n_frames is done to allow each pixel to simultaneously attend to pixels in ALL KEYFRAMES AT ONCE, INSTEAD OF n_frame latent-pairwise computations.
             TODO: Make this code usable for both normal DGE (IP2P) and ZeST (SD-1.5)
             '''
-            k_text = k[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            # k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            # k_uncond = k[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            k_uncond = k[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+
+            k_text = k[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)         # 4,4096x4,320
+            if factor == 3:     # IP2P
+                k_image = k[n_frames: 2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+                k_uncond = k[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            else:               # SD-1.5
+                k_uncond = k[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
 
             v_text = v[:n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            # v_image = v[n_frames:2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            # v_uncond = v[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
-            v_uncond = v[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            if factor == 3:     # IP2P
+                v_image = v[n_frames:2*n_frames].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+                v_uncond = v[2*n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
+            else:               # SD-1.5   
+                v_uncond = v[n_frames:].reshape(1, n_frames * sequence_length, -1).repeat(n_frames, 1, 1)
 
-            q_text = self.head_to_batch_dim(q[:n_frames])
-            # q_image = self.head_to_batch_dim(q[n_frames: 2*n_frames])
-            # q_uncond = self.head_to_batch_dim(q[2 * n_frames:])
-            q_uncond = self.head_to_batch_dim(q[n_frames:])
+            q_text = self.head_to_batch_dim(q[:n_frames])                           # 4,4096,320 -> 32,4096,320//8(40)
+            if factor == 3:     # IP2P
+                q_image = self.head_to_batch_dim(q[n_frames: 2*n_frames])
+                q_uncond = self.head_to_batch_dim(q[2 * n_frames:])
+            else:               # SD-1.5
+                q_uncond = self.head_to_batch_dim(q[n_frames:])
 
-            k_text = self.head_to_batch_dim(k_text)
-            # k_image = self.head_to_batch_dim(k_image)
+            k_text = self.head_to_batch_dim(k_text)                                 # 32,16384,40
+            if factor == 3:
+                k_image = self.head_to_batch_dim(k_image)
             k_uncond = self.head_to_batch_dim(k_uncond)
-
             
-            v_text = self.head_to_batch_dim(v_text)
-            # v_image = self.head_to_batch_dim(v_image)
+            v_text = self.head_to_batch_dim(v_text)                                 # 32,16384,40
+            if factor == 3:
+                v_image = self.head_to_batch_dim(v_image)
             v_uncond = self.head_to_batch_dim(v_uncond)
 
             out_text = []
-            # out_image = []
+            if factor == 3:
+                out_image = []
             out_uncond = []
 
-            q_text = q_text.view(n_frames, h, sequence_length, dim // h)
-            k_text = k_text.view(n_frames, h, sequence_length * n_frames, dim // h)
-            v_text = v_text.view(n_frames, h, sequence_length * n_frames, dim // h)
+            q_text = q_text.view(n_frames, h, sequence_length, dim // h)                # 4,8,4096,40
+            k_text = k_text.view(n_frames, h, sequence_length * n_frames, dim // h)     # 4,8,16384,40
+            v_text = v_text.view(n_frames, h, sequence_length * n_frames, dim // h)     # 4,8,16384,40
 
-            # q_image = q_image.view(n_frames, h, sequence_length, dim // h)
-            # k_image = k_image.view(n_frames, h, sequence_length * n_frames, dim // h)
-            # v_image = v_image.view(n_frames, h, sequence_length * n_frames, dim // h)
+            if factor == 3:
+                q_image = q_image.view(n_frames, h, sequence_length, dim // h)
+                k_image = k_image.view(n_frames, h, sequence_length * n_frames, dim // h)
+                v_image = v_image.view(n_frames, h, sequence_length * n_frames, dim // h)
 
             q_uncond = q_uncond.view(n_frames, h, sequence_length, dim // h)
             k_uncond = k_uncond.view(n_frames, h, sequence_length * n_frames, dim // h)
             v_uncond = v_uncond.view(n_frames, h, sequence_length * n_frames, dim // h)
 
-            for j in range(h):
-                sim_text = torch.bmm(q_text[:, j], k_text[:, j].transpose(-1, -2)) * self.scale
-                # sim_image = torch.bmm(q_image[:, j], k_image[:, j].transpose(-1, -2)) * self.scale
+            for j in range(h):      # torch.bmm : batch matrix multiplication 
+                sim_text = torch.bmm(q_text[:, j], k_text[:, j].transpose(-1, -2)) * self.scale         # 4,4096,16384  (pixel-pairwise attention scores)
+                if factor == 3:
+                    sim_image = torch.bmm(q_image[:, j], k_image[:, j].transpose(-1, -2)) * self.scale
                 sim_uncond = torch.bmm(q_uncond[:, j], k_uncond[:, j].transpose(-1, -2)) * self.scale
                 
-                out_text.append(torch.bmm(sim_text.softmax(dim=-1), v_text[:, j]))
-                # out_image.append(torch.bmm(sim_image.softmax(dim=-1), v_image[:, j]))
+                out_text.append(torch.bmm(sim_text.softmax(dim=-1), v_text[:, j]))              # output embeddings : 
+                if factor == 3:
+                    out_image.append(torch.bmm(sim_image.softmax(dim=-1), v_image[:, j]))
                 out_uncond.append(torch.bmm(sim_uncond.softmax(dim=-1), v_uncond[:, j]))
 
             out_text = torch.cat(out_text, dim=0).view(h, n_frames, sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
-            # out_image = torch.cat(out_image, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
+            if factor == 3:
+                out_image = torch.cat(out_image, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
             out_uncond = torch.cat(out_uncond, dim=0).view(h, n_frames,sequence_length, dim // h).permute(1, 0, 2, 3).reshape(h * n_frames, sequence_length, -1)
 
-            # out = torch.cat([out_text, out_image, out_uncond], dim=0)
-            out = torch.cat([out_text, out_uncond], dim=0)
-            out = self.batch_to_head_dim(out)
+            if factor == 3:
+                out = torch.cat([out_text, out_image, out_uncond], dim=0)
+            else:
+                out = torch.cat([out_text, out_uncond], dim=0)
+            out = self.batch_to_head_dim(out)       # 8,4096,320
 
             return to_out(out)
 
@@ -377,9 +412,11 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             
             # hidden states : pixel-wise embeddings (dim=320) of each pixel in 64x64 latent
             # Reshape 8 -> 2,4 (two rows of replicas of the same 4 frames)
-            batch_size, sequence_length, dim = hidden_states.shape      # 8,4096,320          # Normal DGE : 3,4096,320
-            n_frames = batch_size // 2      # 3
-            hidden_states = hidden_states.view(2, n_frames, sequence_length, dim)   # 2,4,4096,320  (Actual : 3)
+            batch_size, sequence_length, dim = hidden_states.shape      # 8,4096,320 ... 8,1024,640         # Normal DGE : 3,4096,320
+            factor = self.conditioning_factor      # 2 for ZeST (SD-1.5), 3 for normal DGE (IP2P)
+            assert factor in [2,3]                 # Support both SD-1.5 and IP2P
+            n_frames = batch_size // factor      # 3
+            hidden_states = hidden_states.view(factor, n_frames, sequence_length, dim)   # 2,4,4096,320  (Actual : 3)
 
             if self.use_ada_layer_norm:
                 norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -390,7 +427,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
             else:
                 norm_hidden_states = self.norm1(hidden_states)
         
-            norm_hidden_states = norm_hidden_states.view(2, n_frames, sequence_length, dim)  # 3
+            norm_hidden_states = norm_hidden_states.view(factor, n_frames, sequence_length, dim)  # 3
             if self.pivotal_pass:
                 self.pivot_hidden_states = norm_hidden_states       
             if not hasattr(self, 'use_normal_attn'):
@@ -411,12 +448,12 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         batch_idxs.append(self.batch_idx - 1)
                     idx1 = []
                     idx2 = []
-                    cam_distance = compute_camera_distance(self.cams, self.key_cams)        # shape : 20,4
+                    cam_distance = compute_camera_distance(self.cams, self.key_cams)        # shape : 5,4
                     cam_distance_min = cam_distance.sort(dim=-1)
-                    closest_cam = cam_distance_min[1][:,:len(batch_idxs)]
-                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[1][closest_cam]      # 20,1,4096,320
-                    sim = torch.einsum('bld,bcsd->bcls', norm_hidden_states[1] / norm_hidden_states[1].norm(dim=-1, keepdim=True), closest_cam_pivot_hidden_states / closest_cam_pivot_hidden_states.norm(dim=-1, keepdim=True)).squeeze()
-                        
+                    closest_cam = cam_distance_min[1][:,:len(batch_idxs)]                   # 5,1
+                    closest_cam_pivot_hidden_states = self.pivot_hidden_states[1][closest_cam]      # 5,1,4096,320
+                    sim = torch.einsum('bld,bcsd->bcls', norm_hidden_states[1] / norm_hidden_states[1].norm(dim=-1, keepdim=True), closest_cam_pivot_hidden_states / closest_cam_pivot_hidden_states.norm(dim=-1, keepdim=True)).squeeze()      
+                    # 5,4096,4096 (cosine similarity between each pixel in the current frame and the closest pivot frame)    
                     if len(batch_idxs) == 2:
                         sim1, sim2 = sim.chunk(2, dim=1)
                         sim1 = sim1.view(-1, sequence_length)
@@ -427,7 +464,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         idx2.append(sim2_max[1])
 
                     else:
-                        sim = sim.view(-1, sequence_length)
+                        sim = sim.view(-1, sequence_length)         # 5*4096,4096
                         sim_max = sim.max(dim=-1)
                         idx1.append(sim_max[1])
 
@@ -460,12 +497,12 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         
                     else:
                         idx1 = []
-                        pivot_this_batch = self.pivot_this_batch
+                        pivot_this_batch = self.pivot_this_batch    # Index of pivot of this batch
 
                         idx1_epipolar = self.epipolar_constrains[sequence_length].gather(dim=1, index=closest_cam[:, :, None, None].expand(-1, -1, self.epipolar_constrains[sequence_length].shape[2], self.epipolar_constrains[sequence_length].shape[3])).cuda()
 
-                        idx1_epipolar = idx1_epipolar.view(n_frames, -1, sequence_length)
-                        idx1_epipolar[pivot_this_batch, ...] = False
+                        idx1_epipolar = idx1_epipolar.view(n_frames, -1, sequence_length)       # 5,4096,4096
+                        idx1_epipolar[pivot_this_batch, ...] = False            # This is set to False to remove similar (pivot,pivot) pair contribution
 
                         idx1_epipolar = idx1_epipolar.view(n_frames * sequence_length, sequence_length)
                         idx1_sum = idx1_epipolar.sum(dim=-1)
@@ -474,15 +511,17 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                         sim_max = sim.max(dim=-1)
                         idx1.append(sim_max[1])
                             
-                    idx1 = torch.stack(idx1 * 3, dim=0) # 3, n_frames * seq_len
+                    #####
+                    # TODO: Check this part, 
+                    idx1 = torch.stack(idx1 * factor, dim=0) # 2, 4096 * 5
                     idx1 = idx1.squeeze(1)
 
 
                     if len(batch_idxs) == 2:
-                        idx2 = torch.stack(idx2 * 3, dim=0) # 3, n_frames * seq_len
+                        idx2 = torch.stack(idx2 * factor, dim=0) # 3, n_frames * seq_len
                         idx2 = idx2.squeeze(1)
 
-                            
+                    #####
             
             # 1. Self-Attention
             cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
@@ -504,12 +543,12 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,     # None
                             **cross_attention_kwargs,
                         )
-                    # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim
+                    # 3, n_frames * seq_len, dim - > 3 * n_frames, seq_len, dim     (8,4096,320)
                     self.kf_attn_output = self.attn_output      # Store the key frame attention outputs in the first pivotal pass
 
                 else:
                     batch_kf_size, _, _ = self.kf_attn_output.shape
-                    self.attn_output = self.kf_attn_output.view(2, batch_kf_size // 2, sequence_length, dim)[:,     # 3
+                    self.attn_output = self.kf_attn_output.view(factor, batch_kf_size // factor, sequence_length, dim)[:,     # 3
                                     closest_cam]
 
             if self.use_ada_layer_norm_zero:
@@ -520,32 +559,32 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 if not self.pivotal_pass:
                     if len(batch_idxs) == 2:            # Normal DGE : batch_idxs = [0] (len = 1)
                         attn_1, attn_2 = self.attn_output[:, :, 0], self.attn_output[:, :, 1]
-                        idx1 = idx1.view(2, n_frames, sequence_length)          # 2, n_frames, 4096
-                        idx2 = idx2.view(2, n_frames, sequence_length)
+                        idx1 = idx1.view(factor, n_frames, sequence_length)          # 2, n_frames, 4096
+                        idx2 = idx2.view(factor, n_frames, sequence_length)
                         attn_output1 = attn_1.gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output2 = attn_2.gather(dim=2, index=idx2.unsqueeze(-1).repeat(1, 1, 1, dim))
                         d1 = cam_distance_min[0][:,0]           # 20,1  (closest key cam distance)
                         d2 = cam_distance_min[0][:,1]           # 20,1  (2nd closest key cam distance)
                         w1 = d2 / (d1 + d2)                     # average the two closest key cam distances
                         w1 = torch.sigmoid(w1)
-                        w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(2, 1, sequence_length, dim)     # // 3
-                        attn_output1 = attn_output1.view(2, n_frames, sequence_length, dim)     # // 3
-                        attn_output2 = attn_output2.view(2, n_frames, sequence_length, dim)     # // 3
+                        w1 = w1.unsqueeze(0).unsqueeze(-1).unsqueeze(-1).repeat(factor, 1, sequence_length, dim)     # // 3
+                        attn_output1 = attn_output1.view(factor, n_frames, sequence_length, dim)     # // 3
+                        attn_output2 = attn_output2.view(factor, n_frames, sequence_length, dim)     # // 3
                         attn_output = w1 * attn_output1 + (1 - w1) * attn_output2
                         attn_output = attn_output.reshape(
                             batch_size, sequence_length, dim).half()
                     else:
-                        idx1 = idx1.view(2, n_frames, sequence_length)      # 3    2, n_frames, 4096
+                        idx1 = idx1.view(factor, n_frames, sequence_length)      # 3    2, n_frames, 4096
                         attn_output = self.attn_output[:,:,0].gather(dim=2, index=idx1.unsqueeze(-1).repeat(1, 1, 1, dim))
                         attn_output = attn_output.reshape(batch_size, sequence_length, dim).half()                       
                 else:   #pivotal pass
-                    attn_output = self.attn_output
+                    attn_output = self.attn_output      # 8,4096,320
             else:
                 attn_output = self.attn_output
             
             
-            hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 3,4096,320   -> Next pass: 3,1024,640
-            hidden_states = attn_output + hidden_states
+            hidden_states = hidden_states.reshape(batch_size, sequence_length, dim)  # 8,4096,320
+            hidden_states = attn_output + hidden_states             # x + attn_output(x)
             hidden_states = hidden_states.to(self.norm2.weight.dtype)
             if self.attn2 is not None:
                 norm_hidden_states = (
@@ -562,7 +601,7 @@ def make_dge_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
                 hidden_states = attn_output + hidden_states
 
             # 3. Feed-forward
-            norm_hidden_states = self.norm3(hidden_states)
+            norm_hidden_states = self.norm3(hidden_states)          # 8,4096,320
 
             if self.use_ada_layer_norm_zero:
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]

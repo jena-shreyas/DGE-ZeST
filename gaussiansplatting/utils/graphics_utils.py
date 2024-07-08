@@ -354,9 +354,9 @@ def get_fundamental_matrix_with_H(cam1, cam2, current_H, current_W):
     NDC_2_pixel = torch.tensor([[current_W / 2, 0, current_W / 2], [0, current_H / 2, current_H / 2], [0, 0, 1]]).cuda()
     # NDC_2_pixel_inversed = torch.inverse(NDC_2_pixel)
     NDC_2_pixel = NDC_2_pixel.float()
-    cam_1_tranformation = cam1.full_proj_transform[:, [0,1,3]].T.float()
-    cam_2_tranformation = cam2.full_proj_transform[:, [0,1,3]].T.float()
-    cam_1_pixel = NDC_2_pixel@cam_1_tranformation
+    cam_1_tranformation = cam1.full_proj_transform[:, [0,1,3]].T.float()    # 3,4
+    cam_2_tranformation = cam2.full_proj_transform[:, [0,1,3]].T.float()    # 3,4
+    cam_1_pixel = NDC_2_pixel@cam_1_tranformation                           # 3,4
     cam_2_pixel = NDC_2_pixel@cam_2_tranformation
 
     # print(NDC_2_pixel.dtype, cam_1_tranformation.dtype, cam_2_tranformation.dtype, cam_1_pixel.dtype, cam_2_pixel.dtype)

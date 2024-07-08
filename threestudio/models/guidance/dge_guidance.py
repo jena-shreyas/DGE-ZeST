@@ -27,7 +27,7 @@ from threestudio.models.ip_adapter.utils import (
 from diffusers import StableDiffusionControlNetInpaintPipeline, ControlNetModel
 from diffusers.pipelines.stable_diffusion.pipeline_output import StableDiffusionPipelineOutput
 
-from threestudio.utils.dge_utils import register_pivotal, register_batch_idx, register_cams, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, make_dge_block, isinstance_str, compute_epipolar_constrains
+from threestudio.utils.dge_utils import register_pivotal, register_batch_idx, register_cams, register_conditioning_factor, register_epipolar_constrains, register_extended_attention, register_normal_attention, register_extended_attention, make_dge_block, isinstance_str, compute_epipolar_constrains
 
 @threestudio.register("dge-guidance")
 class DGEGuidance(BaseObject):
@@ -238,6 +238,9 @@ class DGEGuidance(BaseObject):
                     noise_pred_text = []
                     noise_pred_image = []
                     noise_pred_uncond = []
+
+                    # register the dividing factor for the unet (no. of components of noise prediction)
+                    register_conditioning_factor(self.unet, 3)
                     # say, camera_batch_size = 5, len(latents) = 20, then pivotal_idx = [1 random value between each set of b:b+batch_size] (len 4)
                     pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0, len(latents), camera_batch_size) 
                     register_pivotal(self.unet, True)
@@ -328,6 +331,7 @@ class DGEGuidance(BaseObject):
             noise_pred_uncond = []
             pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0,len(latents),camera_batch_size) 
             print(pivotal_idx)
+            register_conditioning_factor(self.unet, 3)
             register_pivotal(self.unet, True)
 
             latent_model_input = torch.cat([latents[pivotal_idx]] * 3)
@@ -336,6 +340,7 @@ class DGEGuidance(BaseObject):
             latent_model_input = torch.cat([latent_model_input, pivot_image_cond_latetns], dim=1)
             
             key_cams = cams[pivotal_idx]
+
             self.forward_unet(latent_model_input, t, encoder_hidden_states=pivot_text_embeddings)
             register_pivotal(self.unet, False)
 
@@ -622,6 +627,7 @@ class DGEZestGuidance(DGEGuidance):
                     # say, camera_batch_size = 5, len(latents) = 20, then pivotal_idx = [1 random value between each set of b:b+batch_size] (len 4)
                     # register pivot idxs
                     pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0, len(latents), camera_batch_size) 
+                    register_conditioning_factor(self.unet, 2)  # SD-1.5 uses 2 conditioning factors
                     register_pivotal(self.unet, True)
                     
                     key_cams = [cams[cam_pivotal_idx] for cam_pivotal_idx in pivotal_idx.tolist()]  # len = 4
@@ -1059,12 +1065,12 @@ class DGEZestGuidance(DGEGuidance):
                 controlnet_keep.append(keeps[0])
 
             # 9. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-            height, width = latent_samples[0].shape[-2:]
-            height = height * self.pipe.vae_scale_factor        # 64 x 8 = 512
-            width = width * self.pipe.vae_scale_factor
+            current_H, current_W = latent_samples[0].shape[-2:]
+            height = current_H * self.pipe.vae_scale_factor        # 64 x 8 = 512
+            width = current_W * self.pipe.vae_scale_factor
 
-            original_size = (height, width)         # 512 x 512
-            target_size = (height, width)           # 512 x 512
+            # original_size = (height, width)         # 512 x 512
+            # target_size = (height, width)           # 512 x 512
 
             # # # 10. Prepare added time ids & embeddings
             # #### SDXL SPECIFIC ####
@@ -1090,12 +1096,13 @@ class DGEZestGuidance(DGEGuidance):
             prompt_embeds = prompt_embeds.to(device)        # 2,81,2048
 
             # 11. Denoising loop
-            # num_warmup_steps = max(len(timesteps) - num_inference_steps * self.pipe.scheduler.order, 0)
-
+            num_warmup_steps = max(len(timesteps) - num_inference_steps * self.pipe.scheduler.order, 0)
             with self.pipe.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     with torch.no_grad():
-                        # expand the latents if we are doing classifier free guidance
+                        # expand the latents if we are doing classifier free guidance. 
+                        # This format of consecutive latent replication is only for controlnet input
+                        # unet will receive batched inputs similar to normal DGE
                         latents = [
                             torch.cat([latents_.unsqueeze(0)] * 2) if self.pipe.do_classifier_free_guidance else latents_
                             for latents_ in latent_samples
@@ -1147,24 +1154,17 @@ class DGEZestGuidance(DGEGuidance):
                             down_block_res_samples.append(down_block_res_sample)     
                             mid_block_res_samples.append(mid_block_res_sample)   # Each element : tensor of 2x1280x8x8
 
-                        if num_channels_unet == 9:
-                            latents = [
-                                torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
-                                for latent_model_input, mask, masked_image_latents in zip(
-                                    latents, masks, masked_images_latents
-                                )
-                            ]
-
                         # find pivotal indices
                         pivotal_idx = torch.randint(camera_batch_size, (len(latent_samples)//camera_batch_size,)) + torch.arange(0, len(latent_samples), camera_batch_size)     # len = 4
                         # pivotal_idx = (0,8,10,16)
+                        register_conditioning_factor(self.pipe.unet, 2)  # SD-1.5 uses 2 conditioning factors
                         register_pivotal(self.pipe.unet, True)
 
                         key_cams = [cams[cam_pivotal_idx] for cam_pivotal_idx in pivotal_idx.tolist()]  # len = 4 (List of tensors of (2,4,64))
                         # Now, only select latent model inputs for pivotal indices
                         '''
-                            TODO: This replication by 3 is prolly not needed. (Specific to IP2P) 
-                            Need to replicate to some other factor
+                            TODO: Study down_block_res_samples and mid_block_res_samples.
+                            
                         '''
 
                         pivot_latents : torch.Tensor = torch.cat([latent_samples[pivotal_idx.tolist()]] * 2)    # 8,4,64,64
@@ -1172,26 +1172,41 @@ class DGEZestGuidance(DGEGuidance):
                         len_pivotal_idxs = pivotal_idx.shape[0]         
                         neg_prompt_embeds, pos_prompt_embeds = torch.cat([prompt_embeds[0].unsqueeze(0)] * len_pivotal_idxs), torch.cat([prompt_embeds[1].unsqueeze(0)] * len_pivotal_idxs)   # 4,81,2048 (x2)
                         pivot_prompt_embeds = torch.cat([neg_prompt_embeds, pos_prompt_embeds], dim=0)    # 8,81,2048
-                        pivot_down_block_res_samples = [down_block_res_samples[idx] for idx in pivotal_idx.tolist()]    # List of 4 lists of tensors of various shapes
-                        pivot_mid_block_res_samples = torch.cat([mid_block_res_samples[idx] for idx in pivotal_idx.tolist()])    # List of 4 tensors of shape 2x1280x16x16
+
+                        # Process down_block_res_samples
+                        ''' 
+                            REQD: ([1,5],[2,6],[3,7],[4,8]) -> [[1,2,3,4],[5,6,7,8]] -> [1,2,3,4,5,6,7,8]
+
+                            -> torch.cat([[1,5],[2,6],[3,7],[4,8]]) -> [1,5,2,6,3,7,4,8] (WRONG)
+                            -> ([1,5],[2,6],[3,7],[4,8]) -> [[1,2,3,4],[5,6,7,8]] -> [1,2,3,4,5,6,7,8] (CORRECT)
+
                         '''
-                            TODO: 
-                            - Check the correct shape of input tensors for normal DGE here 
-                            - Modify these accordingly
-                            - Check how batched input is given to SDXL pipeline
-                            - Also, understand the usage of single forward pass of pivotal latents before actual denoising
-                            - This is likely done to register the pivotal indices (check register_pivotal())
-                        ############################
-                        '''
+                        # 2,seq_len,16,16 [unsqueeze(dim=1)] -> 2,1,seq_len,16,16 [cat(dim=1)] -> 2,4,seq_len,16,16 [view(8,seq_len,16,16)]-> 8,seq_len,16,16 
+                        len_down_block_res_sample = len(down_block_res_samples[0])     # 12
+                        pivot_down_block_res_samples = []
+                        for i in range(len_down_block_res_sample):
+                            pivot_down_block_res_sample = []
+                            for idx in pivotal_idx.tolist():
+                                pivot_down_block_res_sample.append(down_block_res_samples[idx][i].unsqueeze(dim=1))
+                            pivot_down_block_res_sample = torch.cat(pivot_down_block_res_sample, dim=1)    # 2,B,seq_len,16,16
+                            _, B, seq_len, lat_dim, _ = pivot_down_block_res_sample.shape
+                            pivot_down_block_res_sample = pivot_down_block_res_sample.view(2*B, seq_len, lat_dim, lat_dim)    # 2B,seq_len,16,16 (8,seq_len,16,16)
+                            pivot_down_block_res_samples.append(pivot_down_block_res_sample)        # List of 12 tensors of shape 8,seq_len,16,16
+                            
+                        # Process mid_block_res_samples
+                        pivot_mid_block_res_samples = []
+                        for idx in pivotal_idx.tolist():
+                            pivot_mid_block_res_samples.append(mid_block_res_samples[idx].unsqueeze(dim=1))     # 2,1,1280,16,16
+                        pivot_mid_block_res_samples = torch.cat(pivot_mid_block_res_samples, dim=1)    # 2,4,1280,16,16
+                        _, B, seq_len, lat_dim, _ = pivot_mid_block_res_samples.shape
+                        pivot_mid_block_res_samples = pivot_mid_block_res_samples.view(2*B, seq_len, lat_dim, lat_dim)    # 2B,seq_len,16,16
+
+                        # pivot_down_block_res_samples = [down_block_res_samples[idx] for idx in pivotal_idx.tolist()]    # List of 4 lists of tensors of various shapes
+                        # pivot_mid_block_res_samples = torch.cat([mid_block_res_samples[idx] for idx in pivotal_idx.tolist()])    # List of 4 tensors of shape 2x1280x16x16
                         ### 
                         # Now, do a single forward pass through the unet and register the pivotal indices
                         # Has UNet with in_channels = 4, out_channels = 4 (So, input should be of form BS, 4, 64, 64)
 
-                        '''
-                            TODO: Now, look at the DGE block forward.
-                                - Since we're using classifier-free guidance, batch size will actually be 8/2 = 4
-                                - Also, try to understand why batch_size // 3 is done in that forward pass
-                        '''
                         # for i in range(pivotal_idx.shape[0]):
                         #     self.pipe.unet(                 
                         #         pivot_latent_model_inputs[i],
@@ -1204,12 +1219,6 @@ class DGEZestGuidance(DGEGuidance):
                         #         return_dict=False,
                         #     )
 
-
-                        '''
-                            TODO: Issue with batched input. 
-                            Error: The size of tensor a (8) must match the size of tensor b (2) at non-singleton dimension 0
-
-                        '''
                         self.pipe.unet(                 
                                 pivot_latent_model_inputs,          # 8,4,64,64
                                 t,
@@ -1218,22 +1227,22 @@ class DGEZestGuidance(DGEGuidance):
                                 down_block_additional_residuals=pivot_down_block_res_samples, # text prompt + material exemplar + depth map
                                 mid_block_additional_residual=pivot_mid_block_res_samples,
                                 return_dict=False,
-                            )       # added_cond_kwargs=added_cond_kwargs,
+                            )[0]       # added_cond_kwargs=added_cond_kwargs,
                         register_pivotal(self.pipe.unet, False)
 
                         noise_preds_text = []
                         noise_preds_uncond = []
 
                         for i, b in enumerate(range(0, len(latent_samples), camera_batch_size)):
-                            register_batch_idx(self.pipe.unet, i)
+                            register_batch_idx(self.pipe.unet, i)       # 0
                             register_cams(self.pipe.unet, cams[b:b + camera_batch_size], pivotal_idx[i] % camera_batch_size, key_cams) 
                             
                             # establish epipolar constraints between each of the latents and the pivotal latents (20*4*4096*4096)
                             # register these constraints in the unet (prolly?) so that it does constrained denoising of latents
                             epipolar_constraints = {}
                             for down_sample_factor in [1, 2, 4, 8]:
-                                H = height // down_sample_factor
-                                W = width // down_sample_factor
+                                H = current_H // down_sample_factor
+                                W = current_W // down_sample_factor
                                 epipolar_constraints[H * W] = []
                                 for cam in cams[b:b + camera_batch_size]:   # len = 5
                                     cam_epipolar_constraints = []
@@ -1243,27 +1252,55 @@ class DGEZestGuidance(DGEGuidance):
                                 epipolar_constraints[H * W] = torch.stack(epipolar_constraints[H * W], dim=0)     # 5 x 4 x (64**2) x (64**2) (pixel-wise)
                             register_epipolar_constrains(self.pipe.unet, epipolar_constraints)
 
+                            # 8.3.1 Prepare the model inputs for the current batch, similar to the pivotal batch
+                            batch_latents : torch.Tensor = torch.cat([latent_samples[b:b+camera_batch_size]] * 2)    # 10,4,64,64
+                            batch_latent_model_inputs = self.pipe.scheduler.scale_model_input(batch_latents, t)     # normalize the latents
+                            neg_prompt_embeds, pos_prompt_embeds = torch.cat([prompt_embeds[0].unsqueeze(0)] * camera_batch_size), torch.cat([prompt_embeds[1].unsqueeze(0)] * camera_batch_size)   # 4,81,2048 (x2)
+                            batch_prompt_embeds = torch.cat([neg_prompt_embeds, pos_prompt_embeds], dim=0)    # 10,81,768
+
+                            # Prepare down_block_res_samples and mid_block_res_samples
+                            len_down_block_res_sample = len(down_block_res_samples[0])     # 12
+                            batch_down_block_res_samples = []
+                            for i in range(len_down_block_res_sample):
+                                batch_down_block_res_sample = []
+                                for idx in range(b, b+camera_batch_size):
+                                    batch_down_block_res_sample.append(down_block_res_samples[idx][i].unsqueeze(dim=1))
+                                batch_down_block_res_sample = torch.cat(batch_down_block_res_sample, dim=1)    # 2,B,seq_len,16,16
+                                _, B, seq_len, lat_dim, _ = batch_down_block_res_sample.shape
+                                batch_down_block_res_sample = batch_down_block_res_sample.view(2*B, seq_len, lat_dim, lat_dim)    # 2B,seq_len,16,16 (8,seq_len,16,16)
+                                batch_down_block_res_samples.append(batch_down_block_res_sample)        # List of 12 tensors of shape 8,seq_len,16,16
+                                
+                            # Process mid_block_res_samples
+                            batch_mid_block_res_samples = []
+                            for idx in range(b, b+camera_batch_size):
+                                batch_mid_block_res_samples.append(mid_block_res_samples[idx].unsqueeze(1))     # 2,1,1280,16,16
+                            batch_mid_block_res_samples = torch.cat(batch_mid_block_res_samples, dim=1)    # 2,4,1280,16,16
+                            _, B, seq_len, lat_dim, _ = batch_mid_block_res_samples.shape
+                            batch_mid_block_res_samples = batch_mid_block_res_samples.view(2*B, seq_len, lat_dim, lat_dim)    # 2B,seq_len,16,16
+
                             # This time, just pick latents in a given camera batch size
-                            batch_model_inputs: torch.Tensor = latents[b:b+camera_batch_size]   # batch_size * latent_size
+                            # batch_model_inputs: torch.Tensor = latents[b:b+camera_batch_size]   # batch_size * latent_size
                             # predict the noise residual
-                            batch_noise_preds = [self.pipe.unet(
-                                batch_model_input,
+                            batch_noise_preds = self.pipe.unet(
+                                batch_latent_model_inputs,
                                 t,
-                                encoder_hidden_states=prompt_embeds,
+                                encoder_hidden_states=batch_prompt_embeds,
                                 cross_attention_kwargs=None,
-                                down_block_additional_residuals=down_block_res_samples[b:b+camera_batch_size],
-                                mid_block_additional_residual=mid_block_res_samples[b:b+camera_batch_size],
+                                down_block_additional_residuals=batch_down_block_res_samples,
+                                mid_block_additional_residual=batch_mid_block_res_samples,
                                 return_dict=False,
-                            )       # added_cond_kwargs=added_cond_kwargs,
-                                for batch_model_input in batch_model_inputs
-                            ]
-                            batch_noise_preds = torch.cat(batch_noise_preds, dim=0)     # 8 x 4 x 64 x 64
+                            )[0]        # 10 x 4 x 64 x 64
+
+                            
 
                             # perform guidance
                             if self.pipe.do_classifier_free_guidance:
-                                batch_noise_preds_uncond, batch_noise_preds_text = batch_noise_preds.chunk(2)
+                                batch_noise_preds_uncond, batch_noise_preds_text = batch_noise_preds.chunk(2)           # 5,4,64,64  
                                 noise_preds_uncond.append(batch_noise_preds_uncond)
                                 noise_preds_text.append(batch_noise_preds_text)
+
+                        noise_pred_text = torch.cat(noise_pred_text, dim=0)         # 20,4,64,64
+                        noise_pred_uncond = torch.cat(noise_pred_uncond, dim=0)     # 20,4,64,64
 
                         if self.pipe.do_classifier_free_guidance:
                             noise_preds = noise_preds_uncond + guidance_scale * (noise_preds_text - noise_preds_uncond)
@@ -1272,11 +1309,11 @@ class DGEZestGuidance(DGEGuidance):
                             # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
                             noise_preds = rescale_noise_cfg(noise_preds, noise_preds_text, guidance_rescale=guidance_rescale)
 
-                        # compute the previous noisy sample x_t -> x_t-1
+                        # compute the previous noisy sample x_t -> x_t-1 (denoise step-by-step)
                         latent_samples = self.pipe.scheduler.step(noise_preds, t, latent_samples, **extra_step_kwargs, return_dict=False)
 
-                        if num_channels_unet == 4:
-                            init_latents_proper = images_latents
+                        if num_channels_unet == 4:      # here, put mask contributions to latents
+                            init_latents_proper = images_latents        # img latents w/o added noise
                             if self.pipe.do_classifier_free_guidance:
                                 init_masks, _ = masks.chunk(2)
                             else:
@@ -1287,8 +1324,12 @@ class DGEZestGuidance(DGEGuidance):
                                 init_latents_proper = self.pipe.scheduler.add_noise(
                                     init_latents_proper, noise_samples, torch.tensor([noise_timestep])
                                 )
-
+                            # FG -> from new latent samples, BG -> from pure image latents
                             latent_samples = (1 - init_masks) * init_latents_proper + init_masks * latent_samples
+
+                        # call the callback, if provided
+                        if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                            progress_bar.update()
 
         # make sure the VAE is in float32 mode, as it overflows in float16
         if self.vae.dtype == torch.float16 and self.vae.config.force_upcast:
@@ -1301,7 +1342,7 @@ class DGEZestGuidance(DGEGuidance):
             self.pipe.unet.to("cpu")
             self.pipe.controlnet.to("cpu")
             torch.cuda.empty_cache()
-
+        # now, decode denoised latents to images
         images = self.vae.decode(latent_samples / self.vae.config.scaling_factor, return_dict=False)
 
         images = self.pipe.image_processor.postprocess(images, output_type="pil")
@@ -1312,97 +1353,6 @@ class DGEZestGuidance(DGEGuidance):
         print("Editing finished.")
 
         return StableDiffusionPipelineOutput(images=images)
-
-
-        # with torch.no_grad():
-        #     # add noise
-        #     ### TODO: Replace this with SDXL.prepare_latents (pass return_noise=True) -> Gives outputs noise, latents
-        #     ######################
-        #     # noise = torch.randn_like(latents)
-        #     # latents = self.scheduler.add_noise(latents, noise, t)       # noised latents
-        #     ######################
-
-        #     # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
-        #     positive_text_embedding, negative_text_embedding, _ = text_embeddings.chunk(3)
-        #     split_image_cond_latents, _, zero_image_cond_latents = image_cond_latents.chunk(3)
-            
-        #     for t in self.scheduler.timesteps:
-        #         # predict the noise residual with unet, NO grad!
-        #         with torch.no_grad():
-        #             # pred noise
-        #             noise_pred_text = []
-        #             noise_pred_image = []
-        #             noise_pred_uncond = []
-        #             # say, camera_batch_size = 5, len(latents) = 20, then pivotal_idx = [1 random value between each set of b:b+batch_size] (len 4)
-        #             # register pivot idxs
-        #             pivotal_idx = torch.randint(camera_batch_size, (len(latents)//camera_batch_size,)) + torch.arange(0, len(latents), camera_batch_size) 
-        #             register_pivotal(self.unet, True)
-                    
-        #             key_cams = [cams[cam_pivotal_idx] for cam_pivotal_idx in pivotal_idx.tolist()]  # len = 4
-        #             latent_model_input = torch.cat([latents[pivotal_idx]] * 3)      # if each latent 1x4x64x64, this gives 3x4x64x64
-        #             pivot_text_embeddings = torch.cat([positive_text_embedding[pivotal_idx], negative_text_embedding[pivotal_idx], negative_text_embedding[pivotal_idx]], dim=0)
-        #             pivot_image_cond_latetns = torch.cat([split_image_cond_latents[pivotal_idx], split_image_cond_latents[pivotal_idx], zero_image_cond_latents[pivotal_idx]], dim=0)
-        #             latent_model_input = torch.cat([latent_model_input, pivot_image_cond_latetns], dim=1)
-
-        #             # Why are these pivotal latents passed to the unet first?
-        #             # Since unet is for denoising, pivotal latents are possibly being denoised.
-        #             # But their predicted noise is not used, so what happens here?
-
-        #             ### TODO: Replace this with self.pipe.forward_unet()
-        #             ######################
-        #             self.forward_unet(latent_model_input, t, encoder_hidden_states=pivot_text_embeddings)
-        #             register_pivotal(self.unet, False)
-        #             ######################
-
-        #             for i, b in enumerate(range(0, len(latents), camera_batch_size)):
-        #                 register_batch_idx(self.unet, i)
-        #                 register_cams(self.unet, cams[b:b + camera_batch_size], pivotal_idx[i] % camera_batch_size, key_cams) 
-                        
-        #                 # establish epipolar constraints between each of the latents and the pivotal latents (20*4*4096*4096)
-        #                 # register these constraints in the unet (prolly?) so that it does constrained denoising of latents
-        #                 epipolar_constrains = {}
-        #                 for down_sample_factor in [1, 2, 4, 8]:
-        #                     H = current_H // down_sample_factor
-        #                     W = current_W // down_sample_factor
-        #                     epipolar_constrains[H * W] = []
-        #                     for cam in cams[b:b + camera_batch_size]:   # len = 5
-        #                         cam_epipolar_constrains = []
-        #                         for key_cam in key_cams:    # len = 4
-        #                             cam_epipolar_constrains.append(compute_epipolar_constrains(key_cam, cam, current_H=H, current_W=W))  # 10 values
-        #                         epipolar_constrains[H * W].append(torch.stack(cam_epipolar_constrains, dim=0))
-        #                     epipolar_constrains[H * W] = torch.stack(epipolar_constrains[H * W], dim=0)     # 5 x 4 x (64**2) x (64**2) (pixel-wise)
-        #                 register_epipolar_constrains(self.unet, epipolar_constrains)
-
-        #                 batch_model_input = torch.cat([latents[b:b + camera_batch_size]] * 3)   # Again, latents of a given camera batch size are concatenated 3 times. Is it because the output is of 3 channels?
-        #                 batch_text_embeddings = torch.cat([positive_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size], negative_text_embedding[b:b + camera_batch_size]], dim=0)
-        #                 batch_image_cond_latents = torch.cat([split_image_cond_latents[b:b + camera_batch_size], split_image_cond_latents[b:b + camera_batch_size], zero_image_cond_latents[b:b + camera_batch_size]], dim=0)
-        #                 batch_model_input = torch.cat([batch_model_input, batch_image_cond_latents], dim=1)
-
-        #                 # After the pivotal latents are passed to the model and the epipolar constraints registered, 
-        #                 # then latents for each camera in a batch are passed to unet for denoising
-        #                 # Possibly, now that the pivotal latent features are passed to the 
-        #                 batch_noise_pred = self.forward_unet(batch_model_input, t, encoder_hidden_states=batch_text_embeddings)
-        #                 batch_noise_pred_text, batch_noise_pred_image, batch_noise_pred_uncond = batch_noise_pred.chunk(3)
-        #                 noise_pred_text.append(batch_noise_pred_text)
-        #                 noise_pred_image.append(batch_noise_pred_image)
-        #                 noise_pred_uncond.append(batch_noise_pred_uncond)
-
-        #             noise_pred_text = torch.cat(noise_pred_text, dim=0)
-        #             noise_pred_image = torch.cat(noise_pred_image, dim=0)
-        #             noise_pred_uncond = torch.cat(noise_pred_uncond, dim=0)
-
-        #             # perform classifier-free guidance
-        #             noise_pred = (
-        #                 noise_pred_uncond
-        #                 + self.cfg.guidance_scale * (noise_pred_text - noise_pred_image)
-        #                 + self.cfg.condition_scale * (noise_pred_image - noise_pred_uncond)
-        #             )
-
-        #             # get previous sample, continue loop
-        #             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-                    
-        pass
-
         
     def __call__(
         self,
@@ -1570,6 +1520,9 @@ class DGEZestGuidance(DGEGuidance):
             # }
             pass
         else:
+            '''
+            TODO: (8th July) Fix this part.
+            '''
             edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, t, cams)   # 20 x 4 x 64 x 64
             edit_images = self.decode_latents(edit_latents)
             edit_images = F.interpolate(edit_images, (H, W), mode="bilinear")   # 20 x 3 x 512 x 512
