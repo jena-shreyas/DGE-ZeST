@@ -895,7 +895,7 @@ class DGEZestGuidance(DGEGuidance):
         resize_mode = "default"
 
         #######
-        x = images[0]      # For debugging   (PIL IMAGE : (512, 512))   (FG-Grayscaled image IS CORRECT! - CHECKED using visualizer)
+        x = images[0]      # For debugging  (PIL IMAGE : (512, 512))   (FG-Grayscaled image IS CORRECT! - CHECKED using visualizer)
         #######
 
         # prepare FG-Grayscaled images
